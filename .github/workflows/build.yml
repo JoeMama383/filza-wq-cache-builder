@@ -1,0 +1,162 @@
+
+name: Build Filza WQ Cached
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: macos-15
+    timeout-minutes: 30
+
+    steps:
+      - name: Check out builder
+        uses: actions/checkout@v4
+
+      - name: Fetch original restricted IPA
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release download v0-base \
+            --repo "$GITHUB_REPOSITORY" \
+            --pattern 'filza_restricted_nonblocking_startup.ipa' \
+            --dir "$RUNNER_TEMP"
+
+          test -s \
+            "$RUNNER_TEMP/filza_restricted_nonblocking_startup.ipa"
+
+      - name: Verify original Filza binary
+        run: |
+          mkdir -p "$RUNNER_TEMP/payload"
+          cd "$RUNNER_TEMP/payload"
+
+          unzip -q \
+            "$RUNNER_TEMP/filza_restricted_nonblocking_startup.ipa"
+
+          python3 - <<'PY'
+          import hashlib
+          import os
+          from pathlib import Path
+
+          binary = (
+              Path(os.environ["RUNNER_TEMP"])
+              / "payload/Payload/Filza.app/Frameworks/"
+                "FilzaApplySandboxExt.dylib"
+          )
+
+          actual = hashlib.sha256(
+              binary.read_bytes()
+          ).hexdigest()
+
+          expected = (
+              "0e7a31be8d4bcaa6f6a050d66c6096c"
+              "f02d479a42ea0aba07b97b55d0d04f7c5"
+          )
+
+          if actual != expected:
+              raise SystemExit(
+                  f"Filza binary mismatch: {actual}"
+              )
+
+          print("Verified Filza baseline:", actual)
+          PY
+
+      - name: Compile native iOS cache library
+        run: |
+          APP="$RUNNER_TEMP/payload/Payload/Filza.app"
+          SDK="$(xcrun --sdk iphoneos --show-sdk-path)"
+
+          xcrun --sdk iphoneos clang \
+            -arch arm64 \
+            -miphoneos-version-min=17.0 \
+            -isysroot "$SDK" \
+            -O2 \
+            -fobjc-arc \
+            -fvisibility=hidden \
+            -dynamiclib \
+            -Wl,-install_name,@loader_path/WQScanCache.dylib \
+            -framework Foundation \
+            -o "$APP/Frameworks/WQScanCache.dylib" \
+            src/WQScanCache.m
+
+          file "$APP/Frameworks/WQScanCache.dylib"
+
+      - name: Integrate cache into Filza
+        run: |
+          git clone \
+            -q --depth 1 \
+            https://github.com/tyilo/insert_dylib.git \
+            "$RUNNER_TEMP/insert_dylib"
+
+          xcodebuild \
+            -project \
+            "$RUNNER_TEMP/insert_dylib/insert_dylib.xcodeproj" \
+            -scheme insert_dylib \
+            -configuration Release \
+            -derivedDataPath \
+            "$RUNNER_TEMP/insert-dylib-build" \
+            CODE_SIGNING_ALLOWED=NO \
+            build
+
+          TOOL="$(find \
+            "$RUNNER_TEMP/insert-dylib-build" \
+            -type f \
+            -name insert_dylib \
+            -perm -111 | head -n 1)"
+
+          test -n "$TOOL"
+
+          APP="$RUNNER_TEMP/payload/Payload/Filza.app"
+
+          "$TOOL" \
+            --inplace \
+            --all-yes \
+            '@loader_path/WQScanCache.dylib' \
+            "$APP/Frameworks/FilzaApplySandboxExt.dylib"
+
+          otool -L \
+            "$APP/Frameworks/FilzaApplySandboxExt.dylib" \
+            | grep -F '@loader_path/WQScanCache.dylib'
+
+      - name: Ad hoc sign modified application
+        run: |
+          APP="$RUNNER_TEMP/payload/Payload/Filza.app"
+
+          codesign \
+            --force --sign - --timestamp=none \
+            "$APP/Frameworks/WQScanCache.dylib"
+
+          codesign \
+            --force --sign - --timestamp=none \
+            "$APP/Frameworks/FilzaApplySandboxExt.dylib"
+
+          codesign \
+            --force --deep --sign - --timestamp=none \
+            "$APP"
+
+          codesign --verify --deep --verbose=2 "$APP"
+
+      - name: Package experimental Filza IPA
+        run: |
+          cd "$RUNNER_TEMP/payload"
+
+          zip -qry \
+            "$GITHUB_WORKSPACE/FilzaWQCached-experimental.ipa" \
+            Payload
+
+          unzip -tq \
+            "$GITHUB_WORKSPACE/FilzaWQCached-experimental.ipa" \
+            | tail -n 1
+
+          shasum -a 256 \
+            "$GITHUB_WORKSPACE/FilzaWQCached-experimental.ipa"
+
+      - name: Upload IPA artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: FilzaWQCached-experimental
+          path: FilzaWQCached-experimental.ipa
+          retention-days: 7
