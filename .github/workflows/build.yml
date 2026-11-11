@@ -16,13 +16,15 @@ jobs:
       - name: Check out builder
         uses: actions/checkout@v4
 
-      - name: Download and extract original IPA
+      - name: Download original Filza IPA
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
+          set -euo pipefail
+
           mkdir -p "$RUNNER_TEMP/base"
 
-          echo "Available release assets:"
+          echo "Release assets:"
           gh release view v0-base \
             --repo "$GITHUB_REPOSITORY" \
             --json assets \
@@ -32,6 +34,8 @@ jobs:
             --repo "$GITHUB_REPOSITORY" \
             --dir "$RUNNER_TEMP/base"
 
+      - name: Prepare IPA from release attachment
+        run: |
           python3 - <<'PY'
           import os
           import shutil
@@ -48,23 +52,26 @@ jobs:
               and p.suffix.lower() in (".ipa", ".zip")
           ]
 
+          print("Found assets:", [p.name for p in assets])
+
           if len(assets) != 1:
               raise SystemExit(
-                  f"Expected one IPA or ZIP asset, "
-                  f"found: {[p.name for p in assets]}"
+                  "Release v0-base must contain exactly "
+                  "one IPA or ZIP attachment."
               )
 
           asset = assets[0]
-          print("Found:", asset.name)
 
           if asset.suffix.lower() == ".ipa":
               shutil.copyfile(asset, output)
           else:
               with zipfile.ZipFile(asset) as archive:
+                  names = archive.namelist()
                   matches = [
-                      n for n in archive.namelist()
+                      n for n in names
                       if n.lower().endswith(".ipa")
                       and not n.startswith("__MACOSX/")
+                      and not n.endswith("/")
                   ]
 
                   if len(matches) == 1:
@@ -73,29 +80,33 @@ jobs:
                               shutil.copyfileobj(src, dst)
                   elif any(
                       n.startswith("Payload/")
-                      for n in archive.namelist()
+                      for n in names
                   ):
                       shutil.copyfile(asset, output)
                   else:
                       raise SystemExit(
-                          "ZIP does not contain a valid IPA"
+                          "ZIP does not contain a valid IPA."
                       )
 
           with zipfile.ZipFile(output) as archive:
-              required = (
+              expected = (
                   "Payload/Filza.app/Frameworks/"
                   "FilzaApplySandboxExt.dylib"
               )
-              if required not in archive.namelist():
+
+              if expected not in archive.namelist():
                   raise SystemExit(
-                      "Required Filza library not found"
+                      "Required Filza library missing."
                   )
 
-          print("Base IPA successfully prepared")
+          print("Prepared IPA:", output)
+          print("Size:", output.stat().st_size)
           PY
 
-      - name: Verify original Filza binary
+      - name: Verify original English Restricted Filza
         run: |
+          set -euo pipefail
+
           mkdir -p "$RUNNER_TEMP/payload"
           cd "$RUNNER_TEMP/payload"
 
@@ -106,33 +117,56 @@ jobs:
           import os
           from pathlib import Path
 
+          root = Path(os.environ["RUNNER_TEMP"])
           binary = (
-              Path(os.environ["RUNNER_TEMP"])
-              / "payload/Payload/Filza.app/Frameworks/"
-                "FilzaApplySandboxExt.dylib"
+              root / "payload/Payload/Filza.app/"
+              "Frameworks/FilzaApplySandboxExt.dylib"
           )
+
+          if not binary.exists():
+              raise SystemExit(
+                  "FilzaApplySandboxExt.dylib missing."
+              )
 
           actual = hashlib.sha256(
               binary.read_bytes()
           ).hexdigest()
 
           expected = (
-              "0e7a31be8d4bcaa6f6a050d66c6096c"
-              "f02d479a42ea0aba07b97b55d0d04f7c5"
+              "b8cb5f1e48cebdb9"
+              "ee0720abf1ca4005"
+              "69e0aec1fd60e126"
+              "46739f6573bf92dd"
           )
+
+          print("Actual SHA-256:", actual)
+          print("Expected SHA-256:", expected)
 
           if actual != expected:
               raise SystemExit(
-                  f"Filza baseline mismatch: {actual}"
+                  "Unknown Filza build. Refusing to patch."
               )
 
-          print("Verified original Filza binary")
+          print("Original English Restricted Filza verified.")
           PY
+
+      - name: Verify caching source exists
+        run: |
+          set -euo pipefail
+
+          test -s src/WQScanCache.m
+
+          echo "Caching source found."
+          wc -l src/WQScanCache.m
 
       - name: Compile native iOS cache library
         run: |
+          set -euo pipefail
+
           APP="$RUNNER_TEMP/payload/Payload/Filza.app"
           SDK="$(xcrun --sdk iphoneos --show-sdk-path)"
+
+          mkdir -p "$APP/Frameworks"
 
           xcrun --sdk iphoneos clang \
             -arch arm64 \
@@ -147,11 +181,14 @@ jobs:
             -o "$APP/Frameworks/WQScanCache.dylib" \
             src/WQScanCache.m
 
+          echo "Compiled caching library:"
           file "$APP/Frameworks/WQScanCache.dylib"
 
-      - name: Integrate cache into Filza
+      - name: Build Mach-O injection utility
         run: |
-          git clone -q --depth 1 \
+          set -euo pipefail
+
+          git clone --depth 1 \
             https://github.com/tyilo/insert_dylib.git \
             "$RUNNER_TEMP/insert_dylib"
 
@@ -173,38 +210,70 @@ jobs:
 
           test -n "$TOOL"
 
+          echo "$TOOL" > "$RUNNER_TEMP/injector_path"
+
+          echo "Mach-O injection tool compiled."
+
+      - name: Integrate caching library into Filza
+        run: |
+          set -euo pipefail
+
           APP="$RUNNER_TEMP/payload/Payload/Filza.app"
+          TARGET="$APP/Frameworks/FilzaApplySandboxExt.dylib"
+          TOOL="$(cat "$RUNNER_TEMP/injector_path")"
 
           "$TOOL" \
             --inplace \
             --all-yes \
             '@loader_path/WQScanCache.dylib' \
-            "$APP/Frameworks/FilzaApplySandboxExt.dylib"
+            "$TARGET"
 
-          otool -L \
-            "$APP/Frameworks/FilzaApplySandboxExt.dylib" \
+          echo "Checking Mach-O dependencies:"
+
+          otool -L "$TARGET"
+
+          otool -L "$TARGET" \
             | grep -F '@loader_path/WQScanCache.dylib'
 
-      - name: Sign modified application
+          echo "Caching dependency inserted."
+
+      - name: Ad hoc sign modified application
         run: |
+          set -euo pipefail
+
           APP="$RUNNER_TEMP/payload/Payload/Filza.app"
 
           codesign \
-            --force --sign - --timestamp=none \
+            --force \
+            --sign - \
+            --timestamp=none \
             "$APP/Frameworks/WQScanCache.dylib"
 
           codesign \
-            --force --sign - --timestamp=none \
+            --force \
+            --sign - \
+            --timestamp=none \
             "$APP/Frameworks/FilzaApplySandboxExt.dylib"
 
           codesign \
-            --force --deep --sign - --timestamp=none \
+            --force \
+            --deep \
+            --sign - \
+            --timestamp=none \
             "$APP"
 
-          codesign --verify --deep --verbose=2 "$APP"
+          codesign --verify \
+            --deep \
+            --verbose=2 \
+            "$APP"
 
-      - name: Package cached Filza IPA
+          echo "Ad hoc signature verified."
+          echo "SideStore must re-sign for installation."
+
+      - name: Package experimental Filza IPA
         run: |
+          set -euo pipefail
+
           cd "$RUNNER_TEMP/payload"
 
           zip -qry \
@@ -217,9 +286,12 @@ jobs:
           shasum -a 256 \
             "$GITHUB_WORKSPACE/FilzaWQCached-experimental.ipa"
 
-      - name: Upload IPA artifact
+          echo "Experimental IPA successfully packaged."
+
+      - name: Upload completed IPA artifact
         uses: actions/upload-artifact@v4
         with:
           name: FilzaWQCached-experimental
           path: FilzaWQCached-experimental.ipa
+          if-no-files-found: error
           retention-days: 7
