@@ -16,25 +16,90 @@ jobs:
       - name: Check out builder
         uses: actions/checkout@v4
 
-      - name: Fetch original restricted IPA
+      - name: Download and extract original IPA
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
+          mkdir -p "$RUNNER_TEMP/base"
+
+          echo "Available release assets:"
+          gh release view v0-base \
+            --repo "$GITHUB_REPOSITORY" \
+            --json assets \
+            --jq '.assets[].name'
+
           gh release download v0-base \
             --repo "$GITHUB_REPOSITORY" \
-            --pattern 'filza_restricted_nonblocking_startup.ipa' \
-            --dir "$RUNNER_TEMP"
+            --dir "$RUNNER_TEMP/base"
 
-          test -s \
-            "$RUNNER_TEMP/filza_restricted_nonblocking_startup.ipa"
+          python3 - <<'PY'
+          import os
+          import shutil
+          import zipfile
+          from pathlib import Path
+
+          root = Path(os.environ["RUNNER_TEMP"])
+          source = root / "base"
+          output = root / "filza_base.ipa"
+
+          assets = [
+              p for p in source.iterdir()
+              if p.is_file()
+              and p.suffix.lower() in (".ipa", ".zip")
+          ]
+
+          if len(assets) != 1:
+              raise SystemExit(
+                  f"Expected one IPA or ZIP asset, "
+                  f"found: {[p.name for p in assets]}"
+              )
+
+          asset = assets[0]
+          print("Found:", asset.name)
+
+          if asset.suffix.lower() == ".ipa":
+              shutil.copyfile(asset, output)
+          else:
+              with zipfile.ZipFile(asset) as archive:
+                  matches = [
+                      n for n in archive.namelist()
+                      if n.lower().endswith(".ipa")
+                      and not n.startswith("__MACOSX/")
+                  ]
+
+                  if len(matches) == 1:
+                      with archive.open(matches[0]) as src:
+                          with output.open("wb") as dst:
+                              shutil.copyfileobj(src, dst)
+                  elif any(
+                      n.startswith("Payload/")
+                      for n in archive.namelist()
+                  ):
+                      shutil.copyfile(asset, output)
+                  else:
+                      raise SystemExit(
+                          "ZIP does not contain a valid IPA"
+                      )
+
+          with zipfile.ZipFile(output) as archive:
+              required = (
+                  "Payload/Filza.app/Frameworks/"
+                  "FilzaApplySandboxExt.dylib"
+              )
+              if required not in archive.namelist():
+                  raise SystemExit(
+                      "Required Filza library not found"
+                  )
+
+          print("Base IPA successfully prepared")
+          PY
 
       - name: Verify original Filza binary
         run: |
           mkdir -p "$RUNNER_TEMP/payload"
           cd "$RUNNER_TEMP/payload"
 
-          unzip -q \
-            "$RUNNER_TEMP/filza_restricted_nonblocking_startup.ipa"
+          unzip -q "$RUNNER_TEMP/filza_base.ipa"
 
           python3 - <<'PY'
           import hashlib
@@ -58,10 +123,10 @@ jobs:
 
           if actual != expected:
               raise SystemExit(
-                  f"Filza binary mismatch: {actual}"
+                  f"Filza baseline mismatch: {actual}"
               )
 
-          print("Verified Filza baseline:", actual)
+          print("Verified original Filza binary")
           PY
 
       - name: Compile native iOS cache library
@@ -86,8 +151,7 @@ jobs:
 
       - name: Integrate cache into Filza
         run: |
-          git clone \
-            -q --depth 1 \
+          git clone -q --depth 1 \
             https://github.com/tyilo/insert_dylib.git \
             "$RUNNER_TEMP/insert_dylib"
 
@@ -121,7 +185,7 @@ jobs:
             "$APP/Frameworks/FilzaApplySandboxExt.dylib" \
             | grep -F '@loader_path/WQScanCache.dylib'
 
-      - name: Ad hoc sign modified application
+      - name: Sign modified application
         run: |
           APP="$RUNNER_TEMP/payload/Payload/Filza.app"
 
@@ -139,7 +203,7 @@ jobs:
 
           codesign --verify --deep --verbose=2 "$APP"
 
-      - name: Package experimental Filza IPA
+      - name: Package cached Filza IPA
         run: |
           cd "$RUNNER_TEMP/payload"
 
@@ -148,8 +212,7 @@ jobs:
             Payload
 
           unzip -tq \
-            "$GITHUB_WORKSPACE/FilzaWQCached-experimental.ipa" \
-            | tail -n 1
+            "$GITHUB_WORKSPACE/FilzaWQCached-experimental.ipa"
 
           shasum -a 256 \
             "$GITHUB_WORKSPACE/FilzaWQCached-experimental.ipa"
